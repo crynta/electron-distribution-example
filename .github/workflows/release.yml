@@ -1,0 +1,162 @@
+name: Desktop release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build application
+        run: npm run build:app
+      - name: Check release credentials
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing macOS release secret: $name"
+              exit 1
+            fi
+          done
+      - name: Package, sign and notarize
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx --no-install electron-builder --mac dmg zip --${{ matrix.arch }} --publish never
+      - name: Validate macOS bundle
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          app_count="$(find dist -maxdepth 3 -type d -name '*.app' | wc -l | tr -d ' ')"
+          if [[ "$app_count" != '1' ]]; then
+            echo "::error::Expected exactly one unpacked .app, got $app_count"
+            exit 1
+          fi
+          app="$(find dist -maxdepth 3 -type d -name '*.app' -print -quit)"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          sign_info="$(codesign -dvvv "$app" 2>&1)"
+          echo "$sign_info" | grep -F 'Authority=Developer ID Application:'
+          echo "$sign_info" | grep -F "TeamIdentifier=$APPLE_TEAM_ID"
+          spctl --assess --type execute --verbose=4 "$app"
+          xcrun stapler validate "$app"
+
+          # Read CFBundleExecutable instead of hardcoding the app's binary name.
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          executable="$app/Contents/MacOS/$executable_name"
+          [[ -f "$executable" ]] || { echo "::error::Missing executable: $executable"; exit 1; }
+          actual_arch="$(lipo -archs "$executable")"
+          wanted_arch="$EXPECTED_ARCH"
+          [[ "$wanted_arch" == 'x64' ]] && wanted_arch='x86_64'
+          [[ "$actual_arch" == "$wanted_arch" ]] || {
+            echo "::error::Expected $wanted_arch binary, found: $actual_arch"
+            exit 1
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install Linux packaging prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build application
+        run: npm run build:app
+      - name: Package AppImage, DEB and RPM
+        run: npx --no-install electron-builder --linux AppImage deb rpm --x64 --publish never
+      - name: Inspect packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for extension in AppImage deb rpm; do
+            files=(dist/*."$extension")
+            (( ${#files[@]} > 0 )) || { echo "::error::Missing .$extension"; exit 1; }
+          done
+          for file in dist/*.deb; do dpkg-deb --info "$file"; done
+          for file in dist/*.rpm; do rpm -qip "$file"; done
+          for file in dist/*.AppImage; do file "$file"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum *.dmg *.zip *.AppImage *.deb *.rpm > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true

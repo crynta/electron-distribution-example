@@ -1,0 +1,32 @@
+# electron-builder v26 example. Replace app metadata and `files` for your project.
+appId: com.example.desktopapp
+productName: Desktop App
+artifactName: '${productName}-${version}-${os}-${arch}.${ext}'
+
+directories:
+  output: dist
+files:
+  - 'out/**/*' # Replace with your actual compiled Electron app output.
+asar: true
+
+mac:
+  category: public.app-category.music
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: true
+  target:
+    - dmg
+    - zip
+
+linux:
+  category: AudioVideo
+  target:
+    - AppImage
+    - deb
+    - rpm
+
+# Building artifacts only; release publishing is handled by GitHub Actions.
+# If you're using electron-updater, configure its feed/metadata separately.
+publish: null
